@@ -25,10 +25,13 @@ describe('Dev Containers CLI', function () {
 	});
 
 	describe('Command up', () => {
+
 		it('should execute successfully with valid config', async () => {
-			const res = await shellExec(`${cli} up --workspace-folder ${__dirname}/configs/image`);
+			const res = await shellExec(`${cli} up --workspace-folder ${__dirname}/configs/image --include-configuration --include-merged-configuration`);
 			const response = JSON.parse(res.stdout);
 			assert.equal(response.outcome, 'success');
+			assert.equal(response.configuration?.remoteEnv?.TEST_RE, 'TEST_VALUE3');
+			assert.equal(response.mergedConfiguration?.remoteEnv?.TEST_RE, 'TEST_VALUE3');
 			const containerId: string = response.containerId;
 			assert.ok(containerId, 'Container id not found.');
 			await shellExec(`docker rm -f ${containerId}`);
@@ -90,6 +93,85 @@ describe('Dev Containers CLI', function () {
 			after(async () => await devContainerDown({ composeProjectName: upResult?.composeProjectName }));
 			it('should succeed', () => {
 				assert.equal(upResult!.outcome, 'success');
+			});
+		});
+		describe('for minimal docker-compose with custom project name', () => {
+			let upResult: UpResult | null = null;
+			const testFolder = `${__dirname}/configs/compose-with-name`;
+			before(async () => {
+				// build and start the container
+				upResult = await devContainerUp(cli, testFolder, { 'logLevel': 'trace', extraArgs: `--docker-compose-path trigger-compose-v2` });
+			});
+			after(async () => await devContainerDown({ composeProjectName: upResult?.composeProjectName }));
+			it('should succeed', () => {
+				assert.equal(upResult!.outcome, 'success');
+				assert.equal(upResult!.composeProjectName, 'custom-project-name');
+			});
+		});
+		describe('for minimal docker-compose with custom project name using environment variable', () => {
+			let upResult: UpResult | null = null;
+			const testFolder = `${__dirname}/configs/compose-with-name-using-env-var`;
+			before(async () => {
+				// build and start the container
+				upResult = await devContainerUp(cli, testFolder, {
+					logLevel: 'trace',
+					extraArgs: `--docker-compose-path trigger-compose-v2`,
+					env: {
+						...process.env,
+						'CUSTOM_NAME': 'custom-name-with-env-var'
+					}
+				});
+			});
+			after(async () => await devContainerDown({ composeProjectName: upResult?.composeProjectName }));
+			it('should succeed', () => {
+				assert.equal(upResult!.outcome, 'success');
+				assert.equal(upResult!.composeProjectName, 'custom-name-with-env-var');
+			});
+		});
+		describe('for minimal docker-compose with custom project name "devcontainer" using environment variable', () => {
+			let upResult: UpResult | null = null;
+			const testFolder = `${__dirname}/configs/compose-with-name-using-env-var`;
+			before(async () => {
+				// build and start the container
+				upResult = await devContainerUp(cli, testFolder, {
+					logLevel: 'trace',
+					extraArgs: `--docker-compose-path trigger-compose-v2`,
+					env: {
+						...process.env,
+						'CUSTOM_NAME': 'devcontainer'
+					}
+				});
+			});
+			after(async () => await devContainerDown({ composeProjectName: upResult?.composeProjectName }));
+			it('should succeed', () => {
+				assert.equal(upResult!.outcome, 'success');
+				assert.equal(upResult!.composeProjectName, 'devcontainer');
+			});
+		});
+		describe('for minimal docker-compose with custom project name and custom yaml', () => {
+			let upResult: UpResult | null = null;
+			const testFolder = `${__dirname}/configs/compose-with-name-and-custom-yaml`;
+			before(async () => {
+				// build and start the container
+				upResult = await devContainerUp(cli, testFolder, { 'logLevel': 'trace', extraArgs: `--docker-compose-path trigger-compose-v2` });
+			});
+			after(async () => await devContainerDown({ composeProjectName: upResult?.composeProjectName }));
+			it('should succeed', () => {
+				assert.equal(upResult!.outcome, 'success');
+				assert.equal(upResult!.composeProjectName, 'custom-project-name-custom-yaml');
+			});
+		});
+		describe('for minimal docker-compose without custom project name', () => {
+			let upResult: UpResult | null = null;
+			const testFolder = `${__dirname}/configs/compose-without-name`;
+			before(async () => {
+				// build and start the container
+				upResult = await devContainerUp(cli, testFolder, { 'logLevel': 'trace', extraArgs: `--docker-compose-path trigger-compose-v2` });
+			});
+			after(async () => await devContainerDown({ composeProjectName: upResult?.composeProjectName }));
+			it('should succeed', () => {
+				assert.equal(upResult!.outcome, 'success');
+				assert.equal(upResult!.composeProjectName, 'compose-without-name_devcontainer');
 			});
 		});
 
@@ -183,6 +265,40 @@ describe('Dev Containers CLI', function () {
 
 			await shellExec(`docker rm -f ${containerId}`);
 		});
+
+		it('should follow the correct merge logic for containerEnv using docker compose', async () => {
+			const res = await shellExec(`${cli} up --workspace-folder ${__dirname}/configs/image-containerEnv-issue`);
+			const response = JSON.parse(res.stdout);
+			assert.equal(response.outcome, 'success');
+			const containerId: string = response.containerId;
+			assert.ok(containerId, 'Container id not found.');
+
+			const somePath = await shellExec(`docker exec ${containerId} bash -c 'echo -n $SOME_PATH'`);
+			assert.equal('/tmp/path/doc-ver/loc', somePath.stdout);
+
+			const envWithSpaces = await shellExec(`docker exec ${containerId} bash -c 'echo -n $VAR_WITH_SPACES'`);
+			assert.equal('value with spaces', envWithSpaces.stdout);
+
+			const evalEnvWithCommand = await shellExec(`docker exec ${containerId} bash -c 'eval $ENV_WITH_COMMAND'`);
+			assert.equal('Hello, World!', evalEnvWithCommand.stdout);
+
+			const envWithTestMessage = await shellExec(`docker exec ${containerId} bash -c 'echo -n $Test_Message'`);
+			assert.equal('H"\\n\\ne"\'\'\'llo M:;a/t?h&^iKa%#@!``ni,sk_a-', envWithTestMessage.stdout);			
+
+			const envWithFormat = await shellExec(`docker exec ${containerId} bash -c 'echo -n $ROSCONSOLE_FORMAT'`);
+			assert.equal('[$${severity}] [$${walltime:%Y-%m-%d %H:%M:%S}] [$${node}]: $${message}', envWithFormat.stdout);
+
+			const envWithDoubleQuote = await shellExec(`docker exec ${containerId} bash -c 'echo -n $VAR_WITH_QUOTES_WE_WANT_TO_KEEP'`);
+			assert.equal('value with \"quotes\" we want to keep', envWithDoubleQuote.stdout);
+
+			const envWithDollar = await shellExec(`docker exec ${containerId} bash -c 'echo -n $VAR_WITH_DOLLAR_SIGN'`);
+			assert.equal('value with $dollar sign', envWithDollar.stdout);
+
+			const envWithBackSlash = await shellExec(`docker exec ${containerId} bash -c 'echo -n $VAR_WITH_BACK_SLASH'`);
+			assert.equal('value with \\back slash', envWithBackSlash.stdout);	
+
+			await shellExec(`docker rm -f ${containerId}`);
+		});		
 
 		it('should run with config in subfolder', async () => {
 			const upRes = await shellExec(`${cli} up --workspace-folder ${__dirname}/configs/dockerfile-without-features --config ${__dirname}/configs/dockerfile-without-features/.devcontainer/subfolder/devcontainer.json`);

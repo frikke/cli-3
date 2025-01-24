@@ -4,10 +4,10 @@
  *--------------------------------------------------------------------------------------------*/
 
 
-import { createContainerProperties, startEventSeen, ResolverResult, getTunnelInformation, getDockerfilePath, getDockerContextPath, DockerResolverParameters, isDockerFileConfig, uriToWSLFsPath, WorkspaceConfiguration, getFolderImageName, inspectDockerImage, logUMask, SubstitutedConfig, checkDockerSupportForGPU } from './utils';
+import { createContainerProperties, startEventSeen, ResolverResult, getTunnelInformation, getDockerfilePath, getDockerContextPath, DockerResolverParameters, isDockerFileConfig, uriToWSLFsPath, WorkspaceConfiguration, getFolderImageName, inspectDockerImage, logUMask, SubstitutedConfig, checkDockerSupportForGPU, isBuildKitImagePolicyError } from './utils';
 import { ContainerProperties, setupInContainer, ResolverProgress, ResolverParameters } from '../spec-common/injectHeadless';
 import { ContainerError, toErrorText } from '../spec-common/errors';
-import { ContainerDetails, listContainers, DockerCLIParameters, inspectContainers, dockerCLI, dockerPtyCLI, toPtyExecParameters, ImageDetails, toExecParameters } from '../spec-shutdown/dockerUtils';
+import { ContainerDetails, listContainers, DockerCLIParameters, inspectContainers, dockerCLI, dockerPtyCLI, toPtyExecParameters, ImageDetails, toExecParameters, removeContainer } from '../spec-shutdown/dockerUtils';
 import { DevContainerConfig, DevContainerFromDockerfileConfig, DevContainerFromImageConfig } from '../spec-configuration/configuration';
 import { LogLevel, Log, makeLog } from '../spec-utils/log';
 import { extendImage, getExtendImageBuildInfo, updateRemoteUserUID } from './containerFeatures';
@@ -71,8 +71,14 @@ export async function openDockerfileDevContainer(params: DockerResolverParameter
 }
 
 function createSetupError(originalError: any, container: ContainerDetails | undefined, params: DockerResolverParameters, containerProperties: ContainerProperties | undefined, config: DevContainerConfig | undefined): ContainerError {
+	let description = 'An error occurred setting up the container.';
+
+	if (originalError?.cmdOutput?.includes('docker: Error response from daemon: authorization denied by plugin')) {
+		description = originalError.cmdOutput;
+	}
+
 	const err = originalError instanceof ContainerError ? originalError : new ContainerError({
-		description: 'An error occurred setting up the container.',
+		description,
 		originalError
 	});
 	if (container) {
@@ -94,12 +100,15 @@ async function setupContainer(container: ContainerDetails, params: DockerResolve
 	const { common } = params;
 	const {
 		remoteEnv: extensionHostEnv,
-	} = await setupInContainer(common, containerProperties, mergedConfig, lifecycleCommandOriginMapFromMetadata(imageMetadata));
+		updatedConfig,
+		updatedMergedConfig,
+	} = await setupInContainer(common, containerProperties, config, mergedConfig, lifecycleCommandOriginMapFromMetadata(imageMetadata));
 
 	return {
 		params: common,
 		properties: containerProperties,
-		config,
+		config: updatedConfig,
+		mergedConfig: updatedMergedConfig,
 		resolvedAuthority: {
 			extensionHostEnv,
 		},
@@ -120,7 +129,7 @@ export async function buildNamedImageAndExtend(params: DockerResolverParameters,
 		return await buildAndExtendImage(params, configWithRaw as SubstitutedConfig<DevContainerFromDockerfileConfig>, imageNames, params.buildNoCache ?? false, additionalFeatures);
 	}
 	// image-based dev container - extend
-	return await extendImage(params, configWithRaw, imageNames[0], additionalFeatures, canAddLabelsToContainer);
+	return await extendImage(params, configWithRaw, imageNames[0], argImageNames || [], additionalFeatures, canAddLabelsToContainer);
 }
 
 async function buildAndExtendImage(buildParams: DockerResolverParameters, configWithRaw: SubstitutedConfig<DevContainerFromDockerfileConfig>, baseImageNames: string[], noCache: boolean, additionalFeatures: Record<string, string | boolean | Record<string, string | boolean>>) {
@@ -193,6 +202,9 @@ async function buildAndExtendImage(buildParams: DockerResolverParameters, config
 				args.push('--load'); // (short for --output=docker, i.e. load into normal 'docker images' collection)
 			}
 		}
+		if (buildParams.buildxCacheTo) {
+			args.push('--cache-to', buildParams.buildxCacheTo);
+		}
 		args.push('--build-arg', 'BUILDKIT_INLINE_CACHE=1');
 	} else {
 		args.push('build');
@@ -234,6 +246,10 @@ async function buildAndExtendImage(buildParams: DockerResolverParameters, config
 			args.push('--build-arg', `${key}=${buildArgs[key]}`);
 		}
 	}
+	const buildOptions = config.build?.options;
+	if (buildOptions?.length) {
+		args.push(...buildOptions);
+	}
 	args.push(...additionalBuildArgs);
 	args.push(await uriToWSLFsPath(getDockerContextPath(cliHost, config), cliHost));
 	try {
@@ -245,6 +261,10 @@ async function buildAndExtendImage(buildParams: DockerResolverParameters, config
 			await dockerCLI(infoParams, ...args);
 		}
 	} catch (err) {
+		if (isBuildKitImagePolicyError(err)) {
+			throw new ContainerError({ description: 'Could not resolve image due to policy.', originalError: err, data: { fileWithError: dockerfilePath } });
+		}
+
 		throw new ContainerError({ description: 'An error occurred building the image.', originalError: err, data: { fileWithError: dockerfilePath } });
 	}
 
@@ -279,7 +299,7 @@ export async function findExistingContainer(params: DockerResolverParameters, la
 	if (container && (params.removeOnStartup === true || params.removeOnStartup === container.Id)) {
 		const text = 'Removing Existing Container';
 		const start = common.output.start(text);
-		await dockerCLI(params, 'rm', '-f', container.Id);
+		await removeContainer(params, container.Id);
 		common.output.stop(text, start);
 		container = undefined;
 	}
@@ -292,7 +312,8 @@ async function startExistingContainer(params: DockerResolverParameters, labels: 
 	if (start) {
 		const starting = 'Starting container';
 		const start = common.output.start(starting);
-		await dockerCLI(params, 'start', container.Id);
+		const infoParams = { ...toExecParameters(params), output: makeLog(common.output, LogLevel.Info), print: 'continuous' as 'continuous' };
+		await dockerCLI(infoParams, 'start', container.Id);
 		common.output.stop(starting, start);
 		let startedContainer = await findDevContainer(params, labels);
 		if (!startedContainer) {
@@ -308,7 +329,7 @@ export async function findDevContainer(params: DockerCLIParameters | DockerResol
 	return details.filter(container => container.State.Status !== 'removing')[0];
 }
 
-export async function extraRunArgs(common: ResolverParameters, params: DockerCLIParameters | DockerResolverParameters, config: DevContainerFromDockerfileConfig | DevContainerFromImageConfig) {
+export async function extraRunArgs(common: ResolverParameters, params: DockerResolverParameters, config: DevContainerFromDockerfileConfig | DevContainerFromImageConfig) {
 	const extraArguments: string[] = [];
 	if (config.hostRequirements?.gpu) {
 		if (await checkDockerSupportForGPU(params)) {

@@ -1,14 +1,23 @@
 import * as path from 'path';
-import * as jsonc from 'jsonc-parser';
 import { Argv } from 'yargs';
 import { LogLevel, mapLogLevel } from '../../spec-utils/log';
 import { getPackageConfig } from '../../spec-utils/product';
 import { createLog } from '../devContainers';
 import { UnpackArgv } from '../devContainersSpecCLI';
-import { isLocalFile, readLocalFile } from '../../spec-utils/pfs';
-import { DevContainerConfig, DevContainerFeature } from '../../spec-configuration/configuration';
+import { isLocalFile } from '../../spec-utils/pfs';
+import { DevContainerFeature } from '../../spec-configuration/configuration';
 import { buildDependencyGraph, computeDependsOnInstallationOrder, generateMermaidDiagram } from '../../spec-configuration/containerFeaturesOrder';
 import { OCISourceInformation, processFeatureIdentifier, userFeaturesToArray } from '../../spec-configuration/containerFeaturesConfiguration';
+import { readLockfile } from '../../spec-configuration/lockfile';
+import { runAsyncHandler } from '../utils';
+import { loadNativeModule } from '../../spec-common/commonUtils';
+import { getCLIHost } from '../../spec-common/cliHost';
+import { ContainerError } from '../../spec-common/errors';
+import { uriToFsPath } from '../../spec-configuration/configurationCommonUtils';
+import { workspaceFromPath } from '../../spec-utils/workspaces';
+import { readDevContainerConfigFile } from '../configContainer';
+import { URI } from 'vscode-uri';
+
 
 interface JsonOutput {
 	installOrder?: {
@@ -28,7 +37,7 @@ export function featuresResolveDependenciesOptions(y: Argv) {
 export type featuresResolveDependenciesArgs = UnpackArgv<ReturnType<typeof featuresResolveDependenciesOptions>>;
 
 export function featuresResolveDependenciesHandler(args: featuresResolveDependenciesArgs) {
-	(async () => await featuresResolveDependencies(args))().catch(console.error);
+	runAsyncHandler(featuresResolveDependencies.bind(null, args));
 }
 
 async function featuresResolveDependencies({
@@ -59,38 +68,39 @@ async function featuresResolveDependencies({
 		configPath = path.join(workspaceFolder, '.devcontainer', 'devcontainer.json');
 	}
 
-	// Load dev container config
-	const buffer = await readLocalFile(configPath);
-	if (!buffer) {
-		output.write(`Could not load devcontainer.json file from path ${configPath}`, LogLevel.Error);
-		process.exit(1);
-	}
-
-	//  Parse dev container config
-	const config: DevContainerConfig = jsonc.parse(buffer.toString());
-	if (!config || !config.features) {
-		output.write(`No Features object in configuration '${configPath}'`, LogLevel.Error);
-		process.exit(1);
-	}
-	const userFeaturesConfig = userFeaturesToArray(config);
-	if (!userFeaturesConfig) {
-		output.write(`Could not parse features object in configuration '${configPath}'`, LogLevel.Error);
-		process.exit(1);
-	}
 	const params = {
 		output,
 		env: process.env,
 	};
 
+	const cwd = workspaceFolder || process.cwd();
+	const cliHost = await getCLIHost(cwd, loadNativeModule, true);
+	const workspace = workspaceFromPath(cliHost.path, workspaceFolder);
+	const configFile: URI = URI.file(path.resolve(process.cwd(), configPath));
+	const configs = await readDevContainerConfigFile(cliHost, workspace, configFile, false, output, undefined, undefined);	
+
+	if (configFile && !configs) {
+		throw new ContainerError({ description: `Dev container config (${uriToFsPath(configFile, cliHost.platform)}) not found.` });
+	}
+	const configWithRaw = configs!.config;
+	const { config } = configWithRaw;
+
+	const userFeaturesConfig = userFeaturesToArray(config);
+	if (!userFeaturesConfig) {
+		output.write(`Could not parse features object in configuration '${configPath}'`, LogLevel.Error);
+		process.exit(1);
+	}
+
+	const { lockfile } = await readLockfile(config);
 	const processFeature = async (_userFeature: DevContainerFeature) => {
-		return await processFeatureIdentifier(params, configPath, workspaceFolder, _userFeature);
+		return await processFeatureIdentifier(params, configPath, workspaceFolder, _userFeature, lockfile);
 	};
 
-	const graph = await buildDependencyGraph(params, processFeature, userFeaturesConfig, config);
+	const graph = await buildDependencyGraph(params, processFeature, userFeaturesConfig, config, lockfile);
 	const worklist = graph?.worklist!;
 	console.log(generateMermaidDiagram(params, worklist));
 
-	const installOrder = await computeDependsOnInstallationOrder(params, processFeature, userFeaturesConfig, config, graph);
+	const installOrder = await computeDependsOnInstallationOrder(params, processFeature, userFeaturesConfig, config, lockfile, graph);
 
 	if (!installOrder) {
 		// Bold

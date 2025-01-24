@@ -7,16 +7,17 @@ import * as path from 'path';
 import * as crypto from 'crypto';
 import * as os from 'os';
 
-import { DockerResolverParameters, DevContainerAuthority, UpdateRemoteUserUIDDefault, BindMountConsistency, getCacheFolder } from './utils';
+import { mapNodeOSToGOOS, mapNodeArchitectureToGOARCH } from '../spec-configuration/containerCollectionsOCI';
+import { DockerResolverParameters, DevContainerAuthority, UpdateRemoteUserUIDDefault, BindMountConsistency, getCacheFolder, GPUAvailability } from './utils';
 import { createNullLifecycleHook, finishBackgroundTasks, ResolverParameters, UserEnvProbe } from '../spec-common/injectHeadless';
-import { getCLIHost, loadNativeModule } from '../spec-common/commonUtils';
+import { GoARCH, GoOS, getCLIHost, loadNativeModule } from '../spec-common/commonUtils';
 import { resolve } from './configContainer';
 import { URI } from 'vscode-uri';
 import { LogLevel, LogDimensions, toErrorText, createCombinedLog, createTerminalLog, Log, makeLog, LogFormat, createJSONLog, createPlainLog, LogHandler, replaceAllLog } from '../spec-utils/log';
 import { dockerComposeCLIConfig } from './dockerCompose';
 import { Mount } from '../spec-configuration/containerFeaturesConfiguration';
 import { getPackageConfig, PackageConfiguration } from '../spec-utils/product';
-import { dockerBuildKitVersion } from '../spec-shutdown/dockerUtils';
+import { dockerBuildKitVersion, isPodman } from '../spec-shutdown/dockerUtils';
 import { Event } from '../spec-utils/event';
 
 
@@ -27,6 +28,7 @@ export interface ProvisionOptions {
 	containerSystemDataFolder: string | undefined;
 	workspaceFolder: string | undefined;
 	workspaceMountConsistency?: BindMountConsistency;
+	gpuAvailability?: GPUAvailability;
 	mountWorkspaceGitRoot: boolean;
 	configFile: URI | undefined;
 	overrideConfigFile: URI | undefined;
@@ -51,7 +53,9 @@ export interface ProvisionOptions {
 	omitLoggerHeader?: boolean | undefined;
 	buildxPlatform: string | undefined;
 	buildxPush: boolean;
+	additionalLabels: string[];
 	buildxOutput: string | undefined;
+	buildxCacheTo: string | undefined;
 	additionalFeatures?: Record<string, string | boolean | Record<string, string | boolean>>;
 	skipFeatureAutoMapping: boolean;
 	skipPostAttach: boolean;
@@ -66,6 +70,9 @@ export interface ProvisionOptions {
 	experimentalLockfile?: boolean;
 	experimentalFrozenLockfile?: boolean;
 	secretsP?: Promise<Record<string, string>>;
+	omitSyntaxDirective?: boolean;
+	includeConfig?: boolean;
+	includeMergedConfig?: boolean;
 }
 
 export async function launch(options: ProvisionOptions, providedIdLabels: string[] | undefined, disposables: (() => Promise<unknown> | undefined)[]) {
@@ -78,10 +85,12 @@ export async function launch(options: ProvisionOptions, providedIdLabels: string
 	output.stop(text, start);
 	const { dockerContainerId, composeProjectName } = result;
 	return {
-		containerId: dockerContainerId!,
+		containerId: dockerContainerId,
 		composeProjectName,
 		remoteUser: result.properties.user,
 		remoteWorkspaceFolder: result.properties.remoteWorkspaceFolder,
+		configuration: options.includeConfig ? result.config : undefined,
+		mergedConfiguration: options.includeMergedConfig ? result.mergedConfig : undefined,
 		finishBackgroundTasks: async () => {
 			try {
 				await finishBackgroundTasks(result.params.backgroundTasks);
@@ -93,7 +102,7 @@ export async function launch(options: ProvisionOptions, providedIdLabels: string
 }
 
 export async function createDockerParams(options: ProvisionOptions, disposables: (() => Promise<unknown> | undefined)[]): Promise<DockerResolverParameters> {
-	const { persistedFolder, additionalMounts, updateRemoteUserUIDDefault, containerDataFolder, containerSystemDataFolder, workspaceMountConsistency, mountWorkspaceGitRoot, remoteEnv, experimentalLockfile, experimentalFrozenLockfile, omitLoggerHeader, secretsP } = options;
+	const { persistedFolder, additionalMounts, updateRemoteUserUIDDefault, containerDataFolder, containerSystemDataFolder, workspaceMountConsistency, gpuAvailability, mountWorkspaceGitRoot, remoteEnv, experimentalLockfile, experimentalFrozenLockfile, omitLoggerHeader, secretsP } = options;
 	let parsedAuthority: DevContainerAuthority | undefined;
 	if (options.workspaceFolder) {
 		parsedAuthority = { hostPath: options.workspaceFolder } as DevContainerAuthority;
@@ -105,7 +114,8 @@ export async function createDockerParams(options: ProvisionOptions, disposables:
 
 	const appRoot = undefined;
 	const cwd = options.workspaceFolder || process.cwd();
-	const cliHost = await getCLIHost(cwd, loadNativeModule);
+	const allowInheritTTY = options.logFormat === 'text';
+	const cliHost = await getCLIHost(cwd, loadNativeModule, allowInheritTTY);
 	const sessionId = crypto.randomUUID();
 
 	const common: ResolverParameters = {
@@ -130,6 +140,7 @@ export async function createDockerParams(options: ProvisionOptions, disposables:
 		getLogLevel: () => options.logLevel,
 		onDidChangeLogLevel: () => ({ dispose() { } }),
 		loadNativeModule,
+		allowInheritTTY,
 		shutdowns: [],
 		backgroundTasks: [],
 		persistedFolder: persistedFolder || await getCacheFolder(cliHost), // Fallback to tmp folder, even though that isn't 'persistent'
@@ -138,6 +149,7 @@ export async function createDockerParams(options: ProvisionOptions, disposables:
 		buildxPlatform: options.buildxPlatform,
 		buildxPush: options.buildxPush,
 		buildxOutput: options.buildxOutput,
+		buildxCacheTo: options.buildxCacheTo,
 		skipFeatureAutoMapping: options.skipFeatureAutoMapping,
 		skipPostAttach: options.skipPostAttach,
 		containerSessionDataFolder: options.containerSessionDataFolder,
@@ -147,7 +159,8 @@ export async function createDockerParams(options: ProvisionOptions, disposables:
 			repository: options.dotfiles.repository,
 			installCommand: options.dotfiles.installCommand,
 			targetPath: options.dotfiles.targetPath || '~/dotfiles',
-		}
+		},
+		omitSyntaxDirective: options.omitSyntaxDirective,
 	};
 
 	const dockerPath = options.dockerPath || 'docker';
@@ -157,20 +170,50 @@ export async function createDockerParams(options: ProvisionOptions, disposables:
 		env: cliHost.env,
 		output: common.output,
 	}, dockerPath, dockerComposePath);
-	const buildKitVersion = options.useBuildKit === 'never' ? null : (await dockerBuildKitVersion({
+
+	const platformInfo = (() => {
+		if (common.buildxPlatform) {
+			const slash1 = common.buildxPlatform.indexOf('/');
+			const slash2 = common.buildxPlatform.indexOf('/', slash1 + 1);
+			// `--platform linux/amd64/v3` `--platform linux/arm64/v8`
+			if (slash2 !== -1) {
+				return {
+					os: <GoOS> common.buildxPlatform.slice(0, slash1),
+					arch: <GoARCH> common.buildxPlatform.slice(slash1 + 1, slash2),
+					variant: common.buildxPlatform.slice(slash2 + 1),
+				};
+			}
+			// `--platform linux/amd64` and `--platform linux/arm64`
+			return {
+				os: <GoOS> common.buildxPlatform.slice(0, slash1),
+				arch: <GoARCH> common.buildxPlatform.slice(slash1 + 1),
+			};
+		} else {
+			// `--platform` omitted
+			return {
+				os: mapNodeOSToGOOS(cliHost.platform),
+				arch: mapNodeArchitectureToGOARCH(cliHost.arch),
+			};
+		}
+	})();
+
+	const buildKitVersion = options.useBuildKit === 'never' ? undefined : (await dockerBuildKitVersion({
 		cliHost,
 		dockerCLI: dockerPath,
 		dockerComposeCLI,
 		env: cliHost.env,
-		output
+		output,
+		platformInfo
 	}));
 	return {
 		common,
 		parsedAuthority,
 		dockerCLI: dockerPath,
+		isPodman: await isPodman({ exec: cliHost.exec, cmd: dockerPath, env: cliHost.env, output }),
 		dockerComposeCLI: dockerComposeCLI,
 		dockerEnv: cliHost.env,
 		workspaceMountConsistencyDefault: workspaceMountConsistency,
+		gpuAvailability: gpuAvailability || 'detect',
 		mountWorkspaceGitRoot,
 		updateRemoteUserUIDOnMacOS: false,
 		cacheMount: 'bind',
@@ -187,7 +230,10 @@ export async function createDockerParams(options: ProvisionOptions, disposables:
 		experimentalFrozenLockfile,
 		buildxPlatform: common.buildxPlatform,
 		buildxPush: common.buildxPush,
+		additionalLabels: options.additionalLabels,
 		buildxOutput: common.buildxOutput,
+		buildxCacheTo: common.buildxCacheTo,
+		platformInfo
 	};
 }
 
