@@ -2,7 +2,196 @@
 
 Notable changes.
 
+## February 2025
+
+### [0.74.0]
+- Ignore non-writeable HOME (https://github.com/microsoft/vscode-remote-release/issues/10707)
+
+## January 2025
+
+### [0.73.0]
+- Fix: TypeError: Cannot read properties of undefined (reading 'fsPath') (https://github.com/devcontainers/cli/issues/895)
+- Fix: Log output of failing lifecycle scripts (https://github.com/devcontainers/cli/issues/845)
+- Fix: Escaping of metadata in Docker Compose file (https://github.com/devcontainers/cli/issues/904)
+- Fix: Re-authenticate against OCI registry after 403 error (https://github.com/devcontainers/cli/pull/945)
+
+## November 2024
+
+### [0.72.0]
+- Fix: change increment syntax in test library script (https://github.com/devcontainers/cli/pull/896)
+- Increase timeout to 6 seconds (7 attempts) (https://github.com/microsoft/vscode-remote-release/issues/6509)
+- Remove unnecessary log (https://github.com/devcontainers/cli/pull/925)
+
+## September 2024
+
+### [0.71.0]
+- Exit with non-zero code on unexpected errors (https://github.com/microsoft/vscode-remote-release/issues/10217)
+- Add option for GPU availability (https://github.com/microsoft/vscode-remote-release/issues/9385)
+
+### [0.70.0]
+- Add more leniency towards registries that malform WWW-Authenticate (https://github.com/devcontainers/cli/pull/884)
+- Handle concurrent removal (https://github.com/microsoft/vscode-remote-release/issues/6509)
+
+## August 2024
+
+### [0.69.0]
+- Enhance Template metadata (https://github.com/devcontainers/cli/pull/875)
+    - Caches additional Template metadata (such as `files`) onto the manifest
+	- Resolves full file paths for `optionalPaths` directories that only contain one file (for better usability in upstream tools)
+	- Fixes bugs
+
+### [0.68.0]
+- Supporting changes for [Template `optionalPaths` specification](https://github.com/devcontainers/spec/blob/main/docs/specs/devcontainer-templates.md#the-optionalpaths-property) (https://github.com/microsoft/vscode-remote-release/issues/10095)
+	- Publish metadata on Template OCI manifests (https://github.com/devcontainers/cli/pull/865)
+	- Add `--omit-paths` option to `templates apply` command (https://github.com/devcontainers/cli/pull/868)
+	- Add `templates metadata` command (https://github.com/devcontainers/cli/pull/866)
+
+### [0.67.0]
+- Fix containerEnv substitution. (https://github.com/microsoft/vscode-remote-release/issues/10033)
+
+## July 2024
+
+### [0.66.0]
+- Wait for result to be written to stdout. (https://github.com/microsoft/vscode-remote-release/issues/10029)
+
+## June 2024
+
+### [0.65.0]
+- Fix confusing error message with local feature. (https://github.com/devcontainers/cli/issues/834)
+- Add `--label` parameter to `devcontainer build` command. (https://github.com/devcontainers/cli/issues/837)
+- Prefer Docker Compose v2 over v1. (https://github.com/devcontainers/cli/issues/826)
+
+### [0.64.0]
+- Fix project name with env variable. (https://github.com/devcontainers/cli/issues/839)
+
+### [0.63.0]
+- Surface additional information in `devcontainer up`. (https://github.com/devcontainers/cli/pull/836)
+- Changes the config layer of the Feature manifest to a empty descriptor (https://github.com/devcontainers/cli/pull/815)
+
+## May 2024
+
+### [0.62.0]
+- Fix support for project name attribute. (https://github.com/devcontainers/cli/issues/831)
+
+### [0.61.0]
+- Use --depth 1 to make dotfiles install process faster (https://github.com/devcontainers/cli/pull/830)
+- Enable --cache-to and --cache-from in devcontainer up (https://github.com/devcontainers/cli/pull/813)
+- Omit generated image name when `--image-name` is given (https://github.com/devcontainers/cli/pull/812)
+
+### [0.60.0]
+- Support project name attribute. (https://github.com/microsoft/vscode-remote-release/issues/512)
+
+## April 2024
+
+### [0.59.1]
+- Check if image name has registry host. (https://github.com/microsoft/vscode-remote-release/issues/9748)
+
+### [0.59.0]
+- Propagate --cache-from to buildx build. (https://github.com/devcontainers/cli/pull/638)
+- Disable cache on feature build when `--build-no-cache` is passed. (https://github.com/devcontainers/cli/pull/790)
+- Qualify local image for Podman. (https://github.com/microsoft/vscode-remote-release/issues/9748)
+- Stop races docker-compose.devcontainer.containerFeatures file. (https://github.com/devcontainers/cli/issues/801)
+
+## March 2024
+
+### [0.58.0]
+- Allow empty value for remote env. (https://github.com/devcontainers/ci/issues/231)
+- Add generate-docs subcommand for templates and features. (https://github.com/devcontainers/cli/pull/759)
+- Only use SELinux label for Linux hosts. (https://github.com/devcontainers/cli/issues/776)
+
+### [0.57.0]
+- Fix crash updating UID/GID when the image's platform is different from the native CPU arch (https://github.com/devcontainers/cli/pull/746)
+- Add tags with build command (https://github.com/devcontainers/ci/issues/271)
+
+## February 2024
+
+### [0.56.2]
+- Remove dependency on ip package (https://github.com/devcontainers/cli/pull/750)
+
+## January 2024
+
+### [0.56.1]
+- Add hidden `--omit-syntax-directive` flag (https://github.com/devcontainers/cli/pull/728) to disable writing `#syntax` directives in intermediate Dockerfiles, even if provided by the user.  This is an advanced flag meant to mitigate issues involving user namespace remapping.  This flag will be removed in a future release. See https://github.com/moby/buildkit/issues/4556 for more information.
+- Update dependencies (https://github.com/devcontainers/cli/pull/722)
+
+### [0.56.0]
+- Support additional Docker build options (https://github.com/devcontainers/cli/issues/85)
+
+## December 2023
+
+### [0.55.0]
+- Adopt additional_contexts in compose (https://github.com/microsoft/vscode-remote-release/issues/7305)
+- Log `docker start` output (https://github.com/microsoft/vscode-remote-release/issues/5887)
+
+### [0.54.2]
+- Update string in `isBuildKitImagePolicyError` (https://github.com/devcontainers/cli/pull/694)
+- Mount build context as shared with buildah (https://github.com/devcontainers/cli/pull/548)
+
+## November 2023
+
+### [0.54.1]
+
+- Fix authentication against Artifactory (https://github.com/devcontainers/cli/pull/692)
+
+### [0.54.0]
+
+- Force deterministic order of `outdated` command (https://github.com/devcontainers/cli/pull/681)
+- Remove vscode-dev-containers dependency (https://github.com/devcontainers/cli/pull/682)
+- Remove additional unused code (https://github.com/devcontainers/cli/commit/2d24543380dfc4d54e76b582536b52226af133c8)
+- Update dependencies including node-pty (https://github.com/devcontainers/cli/pull/685)
+- Update Third-party notices (https://github.com/devcontainers/cli/pull/686)
+- Edit a Feature pinned version via upgrade command behind hidden flag (https://github.com/devcontainers/cli/pull/684)
+
+### [0.53.0]
+
+- add `--dry-run` to `upgrade` command (https://github.com/devcontainers/cli/pull/679)
+- Fix version sorting and report major version in `outdated` command (https://github.com/devcontainers/cli/pull/670)
+	- NOTE: This changes the signature of the `features info` command and the output of publishing Features/Templates.  The key `publishedVersions` has been renamed to `publishedTags` to better mirror the key's values.
+- Docker compose: Updates create error description to include cause for docker auth plugin errors (https://github.com/devcontainers/cli/pull/660)
+
+## October 2023
+
+### [0.52.1]
+
+- Updates create error description to include cause for docker auth plugin errors (https://github.com/devcontainers/cli/pull/656)
+
+### [0.52.0]
+
+- Add `upgrade` command to generate an updated lockfile (https://github.com/devcontainers/cli/pull/645)
+
+## September 2023
+
+### [0.51.3]
+
+- Update UID only if GID is in use (https://github.com/microsoft/vscode-remote-release/issues/7284)
+- Empty lockfile in workspaceFolder will initialize lockfile (https://github.com/devcontainers/cli/pull/637)
+
+## August 2023
+
+### [0.51.2]
+
+- Surface buildkit policy errors (https://github.com/devcontainers/cli/pull/627)
+
+### [0.51.1]
+- Handle missing entry in /etc/passwd gracefully (https://github.com/microsoft/vscode-remote-release/issues/8875)
+
+### [0.51.0]
+- Add `--cache-to` option to `devcontainer build` command (https://github.com/devcontainers/cli/pull/570)
+- Fix: Fallback when getent is not available (https://github.com/microsoft/vscode-remote-release/issues/8811)
+
 ## July 2023
+
+### [0.50.2]
+- Fix: Only allocate tty for `docker exec` when stdin is a tty (https://github.com/devcontainers/cli/issues/606)
+
+### [0.50.1]
+- Fix: Allocate pty for `docker exec` (https://github.com/devcontainers/cli/issues/556)
+
+### [0.50.0]
+- Publish without node-pty dependency (https://github.com/devcontainers/cli/pull/585)
+- Record feature dependencies in the lockfile (https://github.com/devcontainers/cli/pull/566)
+- Record features referenced by tarball URI in lockfile (https://github.com/devcontainers/cli/pull/594)
+- Update proxy-agent to avoid vm2 (https://github.com/devcontainers/cli/pull/596)
 
 ### [0.49.0]
 - Outdated command (https://github.com/devcontainers/cli/pull/565)

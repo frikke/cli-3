@@ -14,6 +14,7 @@ import { getArchiveName, OCICollectionFileName } from '../collectionCommonUtils/
 import { publishOptions } from '../collectionCommonUtils/publish';
 import { getCollectionRef, getRef, OCICollectionRef } from '../../spec-configuration/containerCollectionsOCI';
 import { doPublishCommand, doPublishMetadata } from '../collectionCommonUtils/publishCommandImpl';
+import { runAsyncHandler } from '../utils';
 
 const collectionType = 'feature';
 export function featuresPublishOptions(y: Argv) {
@@ -23,7 +24,7 @@ export function featuresPublishOptions(y: Argv) {
 export type FeaturesPublishArgs = UnpackArgv<ReturnType<typeof featuresPublishOptions>>;
 
 export function featuresPublishHandler(args: FeaturesPublishArgs) {
-    (async () => await featuresPublish(args))().catch(console.error);
+	runAsyncHandler(featuresPublish.bind(null, args));
 }
 
 async function featuresPublish({
@@ -40,7 +41,7 @@ async function featuresPublish({
     const pkg = getPackageConfig();
 
     const cwd = process.cwd();
-    const cliHost = await getCLIHost(cwd, loadNativeModule);
+    const cliHost = await getCLIHost(cwd, loadNativeModule, true);
     const output = createLog({
         logLevel: mapLogLevel(inputLogLevel),
         logFormat: 'text',
@@ -100,7 +101,7 @@ async function featuresPublish({
             process.exit(1);
         }
 
-        const isPublished = (publishResult?.digest && publishResult?.publishedVersions.length > 0);
+        const isPublished = (publishResult?.digest && publishResult?.publishedTags.length > 0);
         let thisResult = isPublished ? {
             ...publishResult,
             version: f.version,
@@ -126,7 +127,7 @@ async function featuresPublish({
                     process.exit(1);
                 }
 
-                if (publishResult?.digest && publishResult?.publishedVersions.length > 0) {
+                if (publishResult?.digest && publishResult?.publishedTags.length > 0) {
                     publishedLegacyIds.push(legacyId);
                 }
             }

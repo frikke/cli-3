@@ -7,6 +7,7 @@ import * as crypto from 'crypto';
 import { Log, LogLevel } from '../spec-utils/log';
 import { isLocalFile, mkdirpLocal, readLocalFile, writeLocalFile } from '../spec-utils/pfs';
 import { requestEnsureAuthenticated } from './httpOCIRegistry';
+import { GoARCH, GoOS, PlatformInfo } from '../spec-common/commonUtils';
 
 export const DEVCONTAINER_MANIFEST_MEDIATYPE = 'application/vnd.devcontainers';
 export const DEVCONTAINER_TAR_LAYER_MEDIATYPE = 'application/vnd.devcontainers.layer.v1+tar';
@@ -91,6 +92,7 @@ interface OCIImageIndexEntry {
 	digest: string;
 	platform: {
 		architecture: string;
+		variant?: string;
 		os: string;
 	};
 }
@@ -116,7 +118,7 @@ const regexForVersionOrDigest = /^[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}$/;
 
 // https://go.dev/doc/install/source#environment
 // Expected by OCI Spec as seen here: https://github.com/opencontainers/image-spec/blob/main/image-index.md#image-index-property-descriptions
-export function mapNodeArchitectureToGOARCH(arch: NodeJS.Architecture): string {
+export function mapNodeArchitectureToGOARCH(arch: NodeJS.Architecture): GoARCH {
 	switch (arch) {
 		case 'x64':
 			return 'amd64';
@@ -127,7 +129,7 @@ export function mapNodeArchitectureToGOARCH(arch: NodeJS.Architecture): string {
 
 // https://go.dev/doc/install/source#environment
 // Expected by OCI Spec as seen here: https://github.com/opencontainers/image-spec/blob/main/image-index.md#image-index-property-descriptions
-export function mapNodeOSToGOOS(os: NodeJS.Platform): string {
+export function mapNodeOSToGOOS(os: NodeJS.Platform): GoOS {
 	switch (os) {
 		case 'win32':
 			return 'windows';
@@ -141,6 +143,12 @@ export function mapNodeOSToGOOS(os: NodeJS.Platform): string {
 export function getRef(output: Log, input: string): OCIRef | undefined {
 	// Normalize input by downcasing entire string
 	input = input.toLowerCase();
+
+	// Invalid if first character is a dot
+	if (input.startsWith('.')) {
+		output.write(`Input '${input}' failed validation.  Expected input to not start with '.'`, LogLevel.Error);
+		return;
+	}
 
 	const indexOfLastColon = input.lastIndexOf(':');
 	const indexOfLastAtCharacter = input.lastIndexOf('@');
@@ -266,13 +274,13 @@ export function getCollectionRef(output: Log, registry: string, namespace: strin
 export async function fetchOCIManifestIfExists(params: CommonParams, ref: OCIRef | OCICollectionRef, manifestDigest?: string): Promise<ManifestContainer | undefined> {
 	const { output } = params;
 
-	// Simple mechanism to avoid making a DNS request for 
+	// Simple mechanism to avoid making a DNS request for
 	// something that is not a domain name.
 	if (ref.registry.indexOf('.') < 0 && !ref.registry.startsWith('localhost')) {
 		return;
 	}
 
-	// TODO: Always use the manifest digest (the canonical digest) 
+	// TODO: Always use the manifest digest (the canonical digest)
 	//       instead of the `ref.version` by referencing some lock file (if available).
 	let reference = ref.version;
 	if (manifestDigest) {
@@ -332,7 +340,7 @@ export async function getManifest(params: CommonParams, url: string, ref: OCIRef
 }
 
 // https://github.com/opencontainers/image-spec/blob/main/manifest.md
-export async function getImageIndexEntryForPlatform(params: CommonParams, url: string, ref: OCIRef | OCICollectionRef, platformInfo: { arch: NodeJS.Architecture; os: NodeJS.Platform }, mimeType?: string): Promise<OCIImageIndexEntry | undefined> {
+export async function getImageIndexEntryForPlatform(params: CommonParams, url: string, ref: OCIRef | OCICollectionRef, platformInfo: PlatformInfo, mimeType?: string): Promise<OCIImageIndexEntry | undefined> {
 	const { output } = params;
 	const response = await getJsonWithMimeType<OCIImageIndex>(params, url, ref, mimeType || 'application/vnd.oci.image.index.v1+json');
 	if (!response) {
@@ -345,15 +353,12 @@ export async function getImageIndexEntryForPlatform(params: CommonParams, url: s
 		return undefined;
 	}
 
-	const ociFriendlyPlatformInfo = {
-		arch: mapNodeArchitectureToGOARCH(platformInfo.arch),
-		os: mapNodeOSToGOOS(platformInfo.os),
-	};
-
 	// Find a manifest for the current architecture and OS.
 	return imageIndex.manifests.find(m => {
-		if (m.platform?.architecture === ociFriendlyPlatformInfo.arch && m.platform?.os === ociFriendlyPlatformInfo.os) {
-			return m;
+		if (m.platform?.architecture === platformInfo.arch && m.platform?.os === platformInfo.os) {
+			if (!platformInfo.variant || m.platform?.variant === platformInfo.variant) {
+				return m;
+			}
 		}
 		return undefined;
 	});
@@ -433,9 +438,28 @@ async function getJsonWithMimeType<T>(params: CommonParams, url: string, ref: OC
 	}
 }
 
-// Lists published versions/tags of a feature/template 
+// Gets published tags and sorts them by ascending semantic version.
+// Omits any tags (eg: 'latest', or major/minor tags '1','1.0') that are not semantic versions.
+export async function getVersionsStrictSorted(params: CommonParams, ref: OCIRef): Promise<string[] | undefined> {
+	const { output } = params;
+
+	const publishedTags = await getPublishedTags(params, ref);
+	if (!publishedTags) {
+		return;
+	}
+
+	const sortedVersions = publishedTags
+		.filter(f => semver.valid(f)) // Remove all major,minor,latest tags
+		.sort((a, b) => semver.compare(a, b));
+
+	output.write(`Published versions (sorted) for '${ref.id}': ${JSON.stringify(sortedVersions, undefined, 2)}`, LogLevel.Trace);
+
+	return sortedVersions;
+}
+
+// Lists published tags of a Feature/Template
 // Specification: https://github.com/opencontainers/distribution-spec/blob/v1.0.1/spec.md#content-discovery
-export async function getPublishedVersions(params: CommonParams, ref: OCIRef, sorted: boolean = false): Promise<string[] | undefined> {
+export async function getPublishedTags(params: CommonParams, ref: OCIRef): Promise<string[] | undefined> {
 	const { output } = params;
 	try {
 		const url = `https://${ref.registry}/v2/${ref.namespace}/${ref.id}/tags/list`;
@@ -470,25 +494,17 @@ export async function getPublishedVersions(params: CommonParams, ref: OCIRef, so
 
 		const publishedVersionsResponse: OCITagList = JSON.parse(body);
 
-		if (!sorted) {
-			return publishedVersionsResponse.tags;
-		}
-
-		// Sort tags in descending order, removing latest.
-		const hasLatest = publishedVersionsResponse.tags.includes('latest');
-		const sortedVersions = publishedVersionsResponse.tags
-			.filter(f => f !== 'latest')
-			.sort((a, b) => semver.compareIdentifiers(a, b));
-
-
-		return hasLatest ? ['latest', ...sortedVersions] : sortedVersions;
+		// Return published tags from the registry as-is, meaning:
+		// - Not necessarily sorted
+		// - *Including* major/minor/latest tags
+		return publishedVersionsResponse.tags;
 	} catch (e) {
 		output.write(`Failed to parse published versions: ${e}`, LogLevel.Error);
 		return;
 	}
 }
 
-export async function getBlob(params: CommonParams, url: string, ociCacheDir: string, destCachePath: string, ociRef: OCIRef, expectedDigest: string, ignoredFilesDuringExtraction: string[] = [], metadataFile?: string): Promise<{ files: string[]; metadata: {} | undefined } | undefined> {
+export async function getBlob(params: CommonParams, url: string, ociCacheDir: string, destCachePath: string, ociRef: OCIRef, expectedDigest: string, omitDuringExtraction: string[] = [], metadataFile?: string): Promise<{ files: string[]; metadata: {} | undefined } | undefined> {
 	// TODO: Parallelize if multiple layers (not likely).
 	// TODO: Seeking might be needed if the size is too large.
 
@@ -527,24 +543,37 @@ export async function getBlob(params: CommonParams, url: string, ociCacheDir: st
 		await mkdirpLocal(destCachePath);
 		await writeLocalFile(tempTarballPath, resBody);
 
+		// https://github.com/devcontainers/spec/blob/main/docs/specs/devcontainer-templates.md#the-optionalpaths-property
+		const directoriesToOmit = omitDuringExtraction.filter(f => f.endsWith('/*')).map(f => f.slice(0, -1));
+		const filesToOmit = omitDuringExtraction.filter(f => !f.endsWith('/*'));
+		
+		output.write(`omitDuringExtraction: '${omitDuringExtraction.join(', ')}`, LogLevel.Trace);
+		output.write(`Files to omit: '${filesToOmit.join(', ')}'`, LogLevel.Info);
+		if (directoriesToOmit.length) {
+			output.write(`Dirs to omit : '${directoriesToOmit.join(', ')}'`, LogLevel.Info);
+		}
+
 		const files: string[] = [];
 		await tar.x(
 			{
 				file: tempTarballPath,
 				cwd: destCachePath,
-				filter: (path: string, stat: tar.FileStat) => {
-					// Skip files that are in the ignore list
-					if (ignoredFilesDuringExtraction.some(f => path.indexOf(f) !== -1)) {
-						// Skip.
-						output.write(`Skipping file '${path}' during blob extraction`, LogLevel.Trace);
-						return false;
+				filter: (tPath: string, stat: tar.FileStat) => {
+					output.write(`Testing '${tPath}'(${stat.type})`, LogLevel.Trace);
+					const cleanedPath = tPath
+						.replace(/\\/g, '/')
+						.replace(/^\.\//, '');
+
+					if (filesToOmit.includes(cleanedPath) || directoriesToOmit.some(d => cleanedPath.startsWith(d))) {
+						output.write(`  Omitting '${tPath}'`, LogLevel.Trace);
+						return false; // Skip
 					}
-					// Keep track of all files extracted, in case the caller is interested.
-					output.write(`${path} : ${stat.type}`, LogLevel.Trace);
-					if ((stat.type.toString() === 'File')) {
-						files.push(path);
+
+					if (stat.type.toString() === 'File') {
+						files.push(tPath);
 					}
-					return true;
+
+					return true; // Keep
 				}
 			}
 		);
@@ -560,8 +589,8 @@ export async function getBlob(params: CommonParams, url: string, ociCacheDir: st
 			{
 				file: tempTarballPath,
 				cwd: ociCacheDir,
-				filter: (path: string, _: tar.FileStat) => {
-					return path === `./${metadataFile}`;
+				filter: (tPath: string, _: tar.FileStat) => {
+					return tPath === `./${metadataFile}`;
 				}
 			});
 		const pathToMetadataFile = path.join(ociCacheDir, metadataFile);

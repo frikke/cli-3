@@ -3,4 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-export type UnpackPromise<T> = T extends Promise<infer U> ? U : T;
+
+export function escapeRegExCharacters(str: string) {
+	return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}

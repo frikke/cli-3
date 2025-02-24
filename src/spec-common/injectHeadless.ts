@@ -10,7 +10,7 @@ import * as crypto from 'crypto';
 
 import { ContainerError, toErrorText, toWarningText } from './errors';
 import { launch, ShellServer } from './shellServer';
-import { ExecFunction, CLIHost, PtyExecFunction, isFile, Exec, PtyExec } from './commonUtils';
+import { ExecFunction, CLIHost, PtyExecFunction, isFile, Exec, PtyExec, getEntPasswdShellCommand } from './commonUtils';
 import { Disposable, Event, NodeEventEmitter } from '../spec-utils/event';
 import { PackageConfiguration } from '../spec-utils/product';
 import { URI } from 'vscode-uri';
@@ -53,6 +53,7 @@ export interface ResolverParameters {
 	getLogLevel: () => LogLevel;
 	onDidChangeLogLevel: Event<LogLevel>;
 	loadNativeModule: <T>(moduleName: string) => Promise<T | undefined>;
+	allowInheritTTY: boolean;
 	shutdowns: (() => Promise<void>)[];
 	backgroundTasks: (Promise<void> | (() => Promise<void>))[];
 	persistedFolder: string; // A path where config can be persisted and restored at a later time. Should default to tmpdir() folder if not provided.
@@ -60,12 +61,14 @@ export interface ResolverParameters {
 	buildxPlatform: string | undefined;
 	buildxPush: boolean;
 	buildxOutput: string | undefined;
+	buildxCacheTo: string | undefined;
 	skipFeatureAutoMapping: boolean;
 	skipPostAttach: boolean;
 	containerSessionDataFolder?: string;
 	skipPersistingCustomizationsFromFeatures: boolean;
 	omitConfigRemotEnvFromMetadata?: boolean;
 	secretsP?: Promise<Record<string, string>>;
+	omitSyntaxDirective?: boolean;
 }
 
 export interface LifecycleHook {
@@ -241,7 +244,7 @@ export async function getContainerProperties(options: {
 		params.output.write(toWarningText(`User ${containerUser} not found with 'getent passwd'.`));
 	}
 	const shell = await getUserShell(containerEnv, passwdUser);
-	const homeFolder = await getHomeFolder(containerEnv, passwdUser);
+	const homeFolder = await getHomeFolder(shellServer, containerEnv, passwdUser);
 	const userDataFolder = getUserDataFolder(homeFolder, params);
 	let rootShellServerP: Promise<ShellServer> | undefined;
 	if (rootShellServer) {
@@ -275,8 +278,19 @@ export async function getUser(shellServer: ShellServer) {
 	return (await shellServer.exec('id -un')).stdout.trim();
 }
 
-export async function getHomeFolder(containerEnv: NodeJS.ProcessEnv, passwdUser: PasswdUser | undefined) {
-	return containerEnv.HOME || (passwdUser && passwdUser.home) || '/root';
+export async function getHomeFolder(shellServer: ShellServer, containerEnv: NodeJS.ProcessEnv, passwdUser: PasswdUser | undefined) {
+	if (containerEnv.HOME) {
+		if (containerEnv.HOME === passwdUser?.home || passwdUser?.uid === '0') {
+			return containerEnv.HOME;
+		}
+		try {
+			await shellServer.exec(`[ ! -e '${containerEnv.HOME}' ] || [ -w '${containerEnv.HOME}' ]`);
+			return containerEnv.HOME;
+		} catch {
+			// Exists but not writable.
+		}
+	}
+	return passwdUser?.home || '/root';
 }
 
 async function getUserShell(containerEnv: NodeJS.ProcessEnv, passwdUser: PasswdUser | undefined) {
@@ -284,7 +298,10 @@ async function getUserShell(containerEnv: NodeJS.ProcessEnv, passwdUser: PasswdU
 }
 
 export async function getUserFromPasswdDB(shellServer: ShellServer, userNameOrId: string) {
-	const { stdout } = await shellServer.exec(`getent passwd ${userNameOrId}`, { logOutput: false });
+	const { stdout } = await shellServer.exec(getEntPasswdShellCommand(userNameOrId), { logOutput: false });
+	if (!stdout.trim()) {
+		return undefined;
+	}
 	return parseUserInPasswdDB(stdout);
 }
 
@@ -317,18 +334,21 @@ export function getSystemVarFolder(params: ResolverParameters): string {
 	return params.containerSystemDataFolder || '/var/devcontainer';
 }
 
-export async function setupInContainer(params: ResolverParameters, containerProperties: ContainerProperties, config: CommonMergedDevContainerConfig, lifecycleCommandOriginMap: LifecycleHooksInstallMap) {
+export async function setupInContainer(params: ResolverParameters, containerProperties: ContainerProperties, config: CommonDevContainerConfig, mergedConfig: CommonMergedDevContainerConfig, lifecycleCommandOriginMap: LifecycleHooksInstallMap) {
 	await patchEtcEnvironment(params, containerProperties);
 	await patchEtcProfile(params, containerProperties);
 	const computeRemoteEnv = params.computeExtensionHostEnv || params.lifecycleHook.enabled;
 	const updatedConfig = containerSubstitute(params.cliHost.platform, config.configFilePath, containerProperties.env, config);
-	const remoteEnv = computeRemoteEnv ? probeRemoteEnv(params, containerProperties, updatedConfig) : Promise.resolve({});
+	const updatedMergedConfig = containerSubstitute(params.cliHost.platform, mergedConfig.configFilePath, containerProperties.env, mergedConfig);
+	const remoteEnv = computeRemoteEnv ? probeRemoteEnv(params, containerProperties, updatedMergedConfig) : Promise.resolve({});
 	const secretsP = params.secretsP || Promise.resolve({});
 	if (params.lifecycleHook.enabled) {
-		await runLifecycleHooks(params, lifecycleCommandOriginMap, containerProperties, updatedConfig, remoteEnv, secretsP, false);
+		await runLifecycleHooks(params, lifecycleCommandOriginMap, containerProperties, updatedMergedConfig, remoteEnv, secretsP, false);
 	}
 	return {
 		remoteEnv: params.computeExtensionHostEnv ? await remoteEnv : {},
+		updatedConfig,
+		updatedMergedConfig,
 	};
 }
 
@@ -478,38 +498,48 @@ async function runLifecycleCommand({ lifecycleHook }: ResolverParameters, contai
 			},
 			onDidChangeDimensions: lifecycleHook.output.onDidChangeDimensions,
 		}, LogLevel.Info);
-		try {
-			const remoteCwd = containerProperties.remoteWorkspaceFolder || containerProperties.homeFolder;
-			async function runSingleCommand(postCommand: string | string[], name?: string) {
-				const progressDetail = typeof postCommand === 'string' ? postCommand : postCommand.join(' ');
-				infoOutput.event({
-					type: 'progress',
-					name: progressName,
-					status: 'running',
-					stepDetail: progressDetail
-				});
-
-				// If we have a command name then the command is running in parallel and 
-				// we need to hold output until the command is done so that the output
-				// doesn't get interleaved with the output of other commands.
-				const printMode = name ? 'off' : 'continuous';
-				const env = { ...(await remoteEnv), ...(await secrets) };
+		const remoteCwd = containerProperties.remoteWorkspaceFolder || containerProperties.homeFolder;
+		async function runSingleCommand(postCommand: string | string[], name?: string) {
+			const progressDetails = typeof postCommand === 'string' ? postCommand : postCommand.join(' ');
+			infoOutput.event({
+				type: 'progress',
+				name: progressName,
+				status: 'running',
+				stepDetail: progressDetails
+			});
+			// If we have a command name then the command is running in parallel and 
+			// we need to hold output until the command is done so that the output
+			// doesn't get interleaved with the output of other commands.
+			const printMode = name ? 'off' : 'continuous';
+			const env = { ...(await remoteEnv), ...(await secrets) };
+			try {
 				const { cmdOutput } = await runRemoteCommand({ ...lifecycleHook, output: infoOutput }, containerProperties, typeof postCommand === 'string' ? ['/bin/sh', '-c', postCommand] : postCommand, remoteCwd, { remoteEnv: env, pty: true, print: printMode });
 
 				// 'name' is set when parallel execution syntax is used.
 				if (name) {
-					infoOutput.raw(`\x1b[1mRunning ${name} from ${userCommandOrigin}...\x1b[0m\r\n${cmdOutput}\r\n`);
+					infoOutput.raw(`\x1b[1mRunning ${name} of ${lifecycleHookName} from ${userCommandOrigin}...\x1b[0m\r\n${cmdOutput}\r\n`);
 				}
-
-				infoOutput.event({
-					type: 'progress',
-					name: progressName,
-					status: 'succeeded',
-				});
+			} catch (err) {
+				if (printMode === 'off' && err?.cmdOutput) {
+					infoOutput.raw(`\r\n\x1b[1m${err.cmdOutput}\x1b[0m\r\n\r\n`);
+				}
+				if (err && (err.code === 130 || err.signal === 2)) { // SIGINT seen on darwin as code === 130, would also make sense as signal === 2.
+					infoOutput.raw(`\r\n\x1b[1m${name ? `${name} of ${lifecycleHookName}` : lifecycleHookName} from ${userCommandOrigin} interrupted.\x1b[0m\r\n\r\n`);
+				} else {
+					if (err?.code) {
+						infoOutput.write(toErrorText(`${name ? `${name} of ${lifecycleHookName}` : lifecycleHookName} from ${userCommandOrigin} failed with exit code ${err.code}. Skipping any further user-provided commands.`));
+					}
+					throw new ContainerError({
+						description: `${name ? `${name} of ${lifecycleHookName}` : lifecycleHookName} from ${userCommandOrigin} failed.`,
+						originalError: err
+					});
+				}
 			}
+		}
 
-			infoOutput.raw(`\x1b[1mRunning the ${lifecycleHookName} from ${userCommandOrigin}...\x1b[0m\r\n\r\n`);
+		infoOutput.raw(`\x1b[1mRunning the ${lifecycleHookName} from ${userCommandOrigin}...\x1b[0m\r\n\r\n`);
 
+		try {
 			let commands;
 			if (typeof userCommand === 'string' || Array.isArray(userCommand)) {
 				commands = [runSingleCommand(userCommand)];
@@ -519,24 +549,24 @@ async function runLifecycleCommand({ lifecycleHook }: ResolverParameters, contai
 					return runSingleCommand(command, name);
 				});
 			}
-			await Promise.all(commands);
+
+			const results = await Promise.allSettled(commands); // Wait for all commands to finish (successfully or not) before continuing.
+			const rejection = results.find(p => p.status === 'rejected');
+			if (rejection) {
+				throw (rejection as PromiseRejectedResult).reason;
+			}
+			infoOutput.event({
+				type: 'progress',
+				name: progressName,
+				status: 'succeeded',
+			});
 		} catch (err) {
 			infoOutput.event({
 				type: 'progress',
 				name: progressName,
 				status: 'failed',
 			});
-			if (err && (err.code === 130 || err.signal === 2)) { // SIGINT seen on darwin as code === 130, would also make sense as signal === 2.
-				infoOutput.raw(`\r\n\x1b[1m${lifecycleHookName} interrupted.\x1b[0m\r\n\r\n`);
-			} else {
-				if (err?.code) {
-					infoOutput.write(toErrorText(`${lifecycleHookName} failed with exit code ${err.code}. Skipping any further user-provided commands.`));
-				}
-				throw new ContainerError({
-					description: `The ${lifecycleHookName} in the ${userCommandOrigin} failed.`,
-					originalError: err,
-				});
-			}
+			throw err;
 		}
 	}
 }
@@ -577,10 +607,10 @@ export async function runRemoteCommand(params: { output: Log; onDidInput?: Event
 				}
 			}
 		});
-		if (params.onDidInput) {
-			params.onDidInput(data => p.write(data));
-		} else if (params.stdin) {
-			const listener = (data: Buffer): void => p.write(data.toString());
+		if (p.write && params.onDidInput) {
+			params.onDidInput(data => p.write!(data));
+		} else if (p.write && params.stdin) {
+			const listener = (data: Buffer): void => p.write!(data.toString());
 			const stdin = params.stdin;
 			if (stdin.isTTY) {
 				stdin.setRawMode(true);

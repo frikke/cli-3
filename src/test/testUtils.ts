@@ -9,6 +9,7 @@ import { SubstituteConfig } from '../spec-node/utils';
 import { LogLevel, createPlainLog, makeLog, nullLog } from '../spec-utils/log';
 import { dockerComposeCLIConfig } from '../spec-node/dockerCompose';
 import { DockerCLIParameters } from '../spec-shutdown/dockerUtils';
+import { mapNodeArchitectureToGOARCH, mapNodeOSToGOOS } from '../spec-configuration/containerCollectionsOCI';
 
 export interface BuildKitOption {
     text: string;
@@ -77,7 +78,7 @@ export interface ExecPtyResult {
 }
 
 export async function shellPtyExec(command: string, options: { stdin?: string } = {}): Promise<ExecPtyResult> {
-    const ptyExec = await plainPtyExec(undefined, loadNativeModule);
+    const ptyExec = await plainPtyExec(undefined, loadNativeModule, true);
     return runCommand({
         ptyExec,
         cmd: '/bin/sh',
@@ -87,13 +88,13 @@ export async function shellPtyExec(command: string, options: { stdin?: string } 
     }).then(res => ({ code: 0, ...res }), error => error);
 }
 
-export async function devContainerUp(cli: string, workspaceFolder: string, options?: { cwd?: string; useBuildKit?: boolean; userDataFolder?: string; logLevel?: string; extraArgs?: string; prefix?: string }): Promise<UpResult> {
+export async function devContainerUp(cli: string, workspaceFolder: string, options?: { cwd?: string; useBuildKit?: boolean; userDataFolder?: string; logLevel?: string; extraArgs?: string; prefix?: string; env?: NodeJS.ProcessEnv }): Promise<UpResult> {
     const buildkitOption = (options?.useBuildKit ?? false) ? '' : ' --buildkit=never';
     const userDataFolderOption = (options?.userDataFolder ?? false) ? ` --user-data-folder=${options?.userDataFolder}` : '';
     const logLevelOption = (options?.logLevel ?? false) ? ` --log-level ${options?.logLevel}` : '';
     const extraArgs = (options?.extraArgs ?? false) ? ` ${options?.extraArgs}` : '';
     const prefix = (options?.prefix ?? false) ? `${options?.prefix} ` : '';
-    const shellExecOptions = { cwd: options?.cwd };
+    const shellExecOptions = { cwd: options?.cwd, env: options?.env };
     const res = await shellExec(`${prefix}${cli} up --workspace-folder ${workspaceFolder}${buildkitOption}${userDataFolderOption}${extraArgs} ${logLevelOption}`, shellExecOptions);
     const response = JSON.parse(res.stdout);
     assert.equal(response.outcome, 'success');
@@ -147,7 +148,7 @@ export const testSubstitute: SubstituteConfig = value => {
 export const output = makeLog(createPlainLog(text => process.stdout.write(text), () => LogLevel.Trace));
 
 export async function createCLIParams(hostPath: string) {
-	const cliHost = await getCLIHost(hostPath, loadNativeModule);
+	const cliHost = await getCLIHost(hostPath, loadNativeModule, true);
 	const dockerComposeCLI = dockerComposeCLIConfig({
 		exec: cliHost.exec,
 		env: cliHost.env,
@@ -159,6 +160,10 @@ export async function createCLIParams(hostPath: string) {
 		dockerComposeCLI,
 		env: {},
 		output,
-	};
+		platformInfo: {
+			os: mapNodeOSToGOOS(cliHost.platform),
+			arch: mapNodeArchitectureToGOARCH(cliHost.arch),
+		}
+};
 	return cliParams;
 }

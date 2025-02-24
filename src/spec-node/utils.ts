@@ -8,14 +8,14 @@ import * as crypto from 'crypto';
 import * as os from 'os';
 
 import { ContainerError, toErrorText } from '../spec-common/errors';
-import { CLIHost, runCommandNoPty, runCommand, getLocalUsername } from '../spec-common/commonUtils';
+import { CLIHost, runCommandNoPty, runCommand, getLocalUsername, PlatformInfo } from '../spec-common/commonUtils';
 import { Log, LogLevel, makeLog, nullLog } from '../spec-utils/log';
 
-import { ContainerProperties, getContainerProperties, LifecycleCommand, ResolverParameters } from '../spec-common/injectHeadless';
+import { CommonDevContainerConfig, ContainerProperties, getContainerProperties, LifecycleCommand, ResolverParameters } from '../spec-common/injectHeadless';
 import { Workspace } from '../spec-utils/workspaces';
 import { URI } from 'vscode-uri';
 import { ShellServer } from '../spec-common/shellServer';
-import { inspectContainer, inspectImage, getEvents, ContainerDetails, DockerCLIParameters, dockerExecFunction, dockerPtyCLI, dockerPtyExecFunction, toDockerImageName, DockerComposeCLI, ImageDetails, dockerCLI } from '../spec-shutdown/dockerUtils';
+import { inspectContainer, inspectImage, getEvents, ContainerDetails, DockerCLIParameters, dockerExecFunction, dockerPtyCLI, dockerPtyExecFunction, toDockerImageName, DockerComposeCLI, ImageDetails, dockerCLI, removeContainer } from '../spec-shutdown/dockerUtils';
 import { getRemoteWorkspaceFolder } from './dockerCompose';
 import { findGitRootFolder } from '../spec-common/git';
 import { parentURI, uriToFsPath } from '../spec-configuration/configurationCommonUtils';
@@ -24,17 +24,18 @@ import { StringDecoder } from 'string_decoder';
 import { Event } from '../spec-utils/event';
 import { Mount } from '../spec-configuration/containerFeaturesConfiguration';
 import { PackageConfiguration } from '../spec-utils/product';
-import { ImageMetadataEntry } from './imageMetadata';
+import { ImageMetadataEntry, MergedDevContainerConfig } from './imageMetadata';
 import { getImageIndexEntryForPlatform, getManifest, getRef } from '../spec-configuration/containerCollectionsOCI';
 import { requestEnsureAuthenticated } from '../spec-configuration/httpOCIRegistry';
 import { configFileLabel, findDevContainer, hostFolderLabel } from './singleContainer';
 
-export { getConfigFilePath, getDockerfilePath, isDockerFileConfig, resolveConfigFilePath } from '../spec-configuration/configuration';
+export { getConfigFilePath, getDockerfilePath, isDockerFileConfig } from '../spec-configuration/configuration';
 export { uriToFsPath, parentURI } from '../spec-configuration/configurationCommonUtils';
-export { CLIHostDocuments, Documents, createDocuments, Edit, fileDocuments, RemoteDocuments } from '../spec-configuration/editableFiles';
 
 
 export type BindMountConsistency = 'consistent' | 'cached' | 'delegated' | undefined;
+
+export type GPUAvailability = 'all' | 'detect' | 'none';
 
 // Generic retry function
 export async function retry<T>(fn: () => Promise<T>, options: { retryIntervalMilliseconds: number; maxRetries: number; output: Log }): Promise<T> {
@@ -97,9 +98,11 @@ export interface DockerResolverParameters {
 	common: ResolverParameters;
 	parsedAuthority: ParsedAuthority | undefined;
 	dockerCLI: string;
+	isPodman: boolean;
 	dockerComposeCLI: () => Promise<DockerComposeCLI>;
 	dockerEnv: NodeJS.ProcessEnv;
 	workspaceMountConsistencyDefault: BindMountConsistency;
+	gpuAvailability: GPUAvailability;
 	mountWorkspaceGitRoot: boolean;
 	updateRemoteUserUIDOnMacOS: boolean;
 	cacheMount: 'volume' | 'bind' | 'none';
@@ -110,24 +113,28 @@ export interface DockerResolverParameters {
 	additionalMounts: Mount[];
 	updateRemoteUserUIDDefault: UpdateRemoteUserUIDDefault;
 	additionalCacheFroms: string[];
-	buildKitVersion: string | null;
+	buildKitVersion: { versionString: string; versionMatch?: string } | undefined;
 	isTTY: boolean;
 	experimentalLockfile?: boolean;
 	experimentalFrozenLockfile?: boolean;
 	buildxPlatform: string | undefined;
 	buildxPush: boolean;
+	additionalLabels: string[];
 	buildxOutput: string | undefined;
+	buildxCacheTo: string | undefined;
+	platformInfo: PlatformInfo;
 }
 
 export interface ResolverResult {
 	params: ResolverParameters;
 	properties: ContainerProperties;
-	config: DevContainerConfig | undefined;
+	config: CommonDevContainerConfig;
+	mergedConfig: MergedDevContainerConfig;
 	resolvedAuthority: { extensionHostEnv?: { [key: string]: string | null } };
 	tunnelInformation: { environmentTunnels?: { remoteAddress: { port: number; host: string }; localAddress: string }[] };
 	isTrusted?: boolean;
-	dockerParams: DockerResolverParameters | undefined;
-	dockerContainerId: string | undefined;
+	dockerParams: DockerResolverParameters;
+	dockerContainerId: string;
 	composeProjectName?: string;
 }
 
@@ -198,10 +205,27 @@ async function hasLabels(params: DockerResolverParameters, info: any, expectedLa
 		.every(name => actualLabels[name] === expectedLabels[name]);
 }
 
-export async function checkDockerSupportForGPU(params: DockerCLIParameters | DockerResolverParameters): Promise<Boolean> {
+export async function checkDockerSupportForGPU(params: DockerResolverParameters): Promise<Boolean> {
+	if (params.gpuAvailability === 'all') {
+		return true;
+	}
+	if (params.gpuAvailability === 'none') {
+		return false;
+	}
 	const result = await dockerCLI(params, 'info', '-f', '{{.Runtimes.nvidia}}');
 	const runtimeFound = result.stdout.includes('nvidia-container-runtime');
 	return runtimeFound;
+}
+
+export function isBuildKitImagePolicyError(err: any): boolean {
+	const imagePolicyErrorString = 'could not resolve image due to policy'; // Seen in Buildkit 0.11.0
+	const sourceDeniedString = 'source denied by policy'; // Seen in Buildkit 0.12.0
+
+	const errCmdOutput = err?.cmdOutput;
+	const errStderr = err?.stderr;
+
+	return (errCmdOutput && typeof errCmdOutput === 'string' && (errCmdOutput.includes(imagePolicyErrorString) || errCmdOutput.includes(sourceDeniedString)))
+		|| (errStderr && typeof errStderr === 'string' && (errStderr.includes(imagePolicyErrorString) || errStderr.includes(sourceDeniedString)));
 }
 
 export async function inspectDockerImage(params: DockerResolverParameters | DockerCLIParameters, imageName: string, pullImageOnError: boolean) {
@@ -211,10 +235,9 @@ export async function inspectDockerImage(params: DockerResolverParameters | Dock
 		if (!pullImageOnError) {
 			throw err;
 		}
-		const cliHost = 'cliHost' in params ? params.cliHost : params.common.cliHost;
 		const output = 'cliHost' in params ? params.output : params.common.output;
 		try {
-			return await inspectImageInRegistry(output, { arch: cliHost.arch, os: cliHost.platform }, imageName);
+			return await inspectImageInRegistry(output, params.platformInfo, imageName);
 		} catch (err2) {
 			output.write(`Error fetching image details: ${err2?.message}`);
 		}
@@ -233,7 +256,7 @@ export async function inspectDockerImage(params: DockerResolverParameters | Dock
 	}
 }
 
-export async function inspectImageInRegistry(output: Log, platformInfo: { arch: NodeJS.Architecture; os: NodeJS.Platform }, name: string): Promise<ImageDetails> {
+export async function inspectImageInRegistry(output: Log, platformInfo: PlatformInfo, name: string): Promise<ImageDetails> {
 	const resourceAndVersion = qualifyImageName(name);
 	const params = { output, env: process.env };
 	const ref = getRef(output, resourceAndVersion);
@@ -247,7 +270,7 @@ export async function inspectImageInRegistry(output: Log, platformInfo: { arch: 
 
 	let targetDigest: string | undefined = undefined;
 	const manifest = await getManifest(params, manifestUrl, ref, 'application/vnd.docker.distribution.manifest.v2+json');
-	if (manifest) {
+	if (manifest?.manifestObj.config) { // Checking for config because the above mime type sometimes returns an image index.
 		targetDigest = manifest.manifestObj.config.digest;
 	} else {
 		// If we couldn't fetch the manifest, perhaps the registry supports querying for the 'Image Index'
@@ -284,6 +307,9 @@ export async function inspectImageInRegistry(output: Log, platformInfo: { arch: 
 	return {
 		Id: targetDigest,
 		Config: obj.config,
+		Os: platformInfo.os,
+		Variant: platformInfo.variant,
+		Architecture: platformInfo.arch,
 	};
 }
 
@@ -380,7 +406,7 @@ export async function createContainerProperties(params: DockerResolverParameters
 	const [, user, , group] = /([^:]*)(:(.*))?/.exec(containerUser) as (string | undefined)[];
 	const containerEnv = envListToObj(containerInfo.Config.Env);
 	const remoteExec = dockerExecFunction(params, containerId, containerUser);
-	const remotePtyExec = await dockerPtyExecFunction(params, containerId, containerUser, common.loadNativeModule);
+	const remotePtyExec = await dockerPtyExecFunction(params, containerId, containerUser, common.loadNativeModule, common.allowInheritTTY);
 	const remoteExecAsRoot = dockerExecFunction(params, containerId, 'root');
 	return getContainerProperties({
 		params: common,
@@ -453,7 +479,7 @@ export async function runInitializeCommand(params: DockerResolverParameters, use
 				infoOutput.raw(`\x1b[1mRunning the ${hookName} from devcontainer.json...\x1b[0m\r\n\r\n`);
 			}
 
-			// If we have a command name then the command is running in parallel and 
+			// If we have a command name then the command is running in parallel and
 			// we need to hold output until the command is done so that the output
 			// doesn't get interleaved with the output of other commands.
 			const print = name ? 'end' : 'continuous';
@@ -547,7 +573,7 @@ export async function findContainerAndIdLabels(params: DockerResolverParameters 
 					container = undefined;
 				} else if (removeContainerWithOldLabels === true || removeContainerWithOldLabels === container.Id) {
 					// Remove container, so it will be rebuilt with new labels.
-					await dockerCLI(params, 'rm', '-f', container.Id);
+					await removeContainer(params, container.Id);
 					container = undefined;
 				}
 			}
@@ -561,4 +587,15 @@ export async function findContainerAndIdLabels(params: DockerResolverParameters 
 			[`${hostFolderLabel}=${workspaceFolder}`, `${configFileLabel}=${configFile}`] :
 			[`${hostFolderLabel}=${workspaceFolder}`],
 	};
+}
+
+export function runAsyncHandler(handler: () => Promise<void>) {
+	(async () => {
+		try {
+			await handler();
+		} catch (err) {
+			console.error(err);
+			process.exit(1);
+		}
+	})();
 }

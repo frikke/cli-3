@@ -10,10 +10,11 @@ import { publishOptions } from '../collectionCommonUtils/publish';
 import { getCLIHost } from '../../spec-common/cliHost';
 import { loadNativeModule } from '../../spec-common/commonUtils';
 import { PackageCommandInput } from '../collectionCommonUtils/package';
-import { getArchiveName, OCICollectionFileName } from '../collectionCommonUtils/packageCommandImpl';
+import { getArchiveName } from '../collectionCommonUtils/packageCommandImpl';
 import { packageTemplates } from './packageImpl';
 import { getCollectionRef, getRef, OCICollectionRef } from '../../spec-configuration/containerCollectionsOCI';
 import { doPublishCommand, doPublishMetadata } from '../collectionCommonUtils/publishCommandImpl';
+import { runAsyncHandler } from '../utils';
 
 const collectionType = 'template';
 
@@ -24,7 +25,7 @@ export function templatesPublishOptions(y: Argv) {
 export type TemplatesPublishArgs = UnpackArgv<ReturnType<typeof templatesPublishOptions>>;
 
 export function templatesPublishHandler(args: TemplatesPublishArgs) {
-    (async () => await templatesPublish(args))().catch(console.error);
+	runAsyncHandler(templatesPublish.bind(null, args));
 }
 
 async function templatesPublish({
@@ -41,7 +42,7 @@ async function templatesPublish({
     const pkg = getPackageConfig();
 
     const cwd = process.cwd();
-    const cliHost = await getCLIHost(cwd, loadNativeModule);
+    const cliHost = await getCLIHost(cwd, loadNativeModule, true);
     const output = createLog({
         logLevel: mapLogLevel(inputLogLevel),
         logFormat: 'text',
@@ -66,7 +67,6 @@ async function templatesPublish({
     const metadata = await packageTemplates(packageArgs);
 
     if (!metadata) {
-        output.write(`(!) ERR: Failed to fetch ${OCICollectionFileName}`, LogLevel.Error);
         process.exit(1);
     }
 
@@ -88,13 +88,20 @@ async function templatesPublish({
         }
 
         const archiveName = getArchiveName(t.id, collectionType);
-        const publishResult = await doPublishCommand(params, t.version, templateRef, outputDir, collectionType, archiveName);
+
+        // Properties here are available on the manifest without needing to download the full Template archive.
+        const templateAnnotations = {
+            'dev.containers.metadata': JSON.stringify(t),
+        };
+        output.write(`Template Annotations: ${JSON.stringify(templateAnnotations)}`, LogLevel.Debug);
+
+        const publishResult = await doPublishCommand(params, t.version, templateRef, outputDir, collectionType, archiveName, templateAnnotations);
         if (!publishResult) {
             output.write(`(!) ERR: Failed to publish '${resource}'`, LogLevel.Error);
             process.exit(1);
         }
 
-        const thisResult = (publishResult?.digest && publishResult?.publishedVersions?.length > 0) ? {
+        const thisResult = (publishResult?.digest && publishResult?.publishedTags?.length > 0) ? {
             ...publishResult,
             version: t.version,
         } : {};

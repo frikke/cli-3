@@ -4,13 +4,11 @@
  *--------------------------------------------------------------------------------------------*/
 
 import * as path from 'path';
-import { StringDecoder } from 'string_decoder';
-import * as tar from 'tar';
 
 import { DevContainerConfig } from '../spec-configuration/configuration';
 import { dockerCLI, dockerPtyCLI, ImageDetails, toExecParameters, toPtyExecParameters } from '../spec-shutdown/dockerUtils';
-import { LogLevel, makeLog, toErrorText } from '../spec-utils/log';
-import { FeaturesConfig, getContainerFeaturesFolder, getContainerFeaturesBaseDockerFile, getFeatureInstallWrapperScript, getFeatureLayers, getFeatureMainValue, getFeatureValueObject, generateFeaturesConfig, Feature, V1_DEVCONTAINER_FEATURES_FILE_NAME, generateContainerEnvs } from '../spec-configuration/containerFeaturesConfiguration';
+import { LogLevel, makeLog } from '../spec-utils/log';
+import { FeaturesConfig, getContainerFeaturesBaseDockerFile, getFeatureInstallWrapperScript, getFeatureLayers, getFeatureMainValue, getFeatureValueObject, generateFeaturesConfig, Feature, generateContainerEnvs } from '../spec-configuration/containerFeaturesConfiguration';
 import { readLocalFile } from '../spec-utils/pfs';
 import { includeAllConfiguredFeatures } from '../spec-utils/product';
 import { createFeaturesTempFolder, DockerResolverParameters, getCacheFolder, getFolderImageName, getEmptyContextFolder, SubstitutedConfig } from './utils';
@@ -24,13 +22,13 @@ import { ContainerError } from '../spec-common/errors';
 // Environment variables must contain:
 //      - alpha-numeric values, or
 //      - the '_' character, and
-//      - a number cannot be the first character 
+//      - a number cannot be the first character
 export const getSafeId = (str: string) => str
 	.replace(/[^\w_]/g, '_')
 	.replace(/^[\d_]+/g, '_')
 	.toUpperCase();
 
-export async function extendImage(params: DockerResolverParameters, config: SubstitutedConfig<DevContainerConfig>, imageName: string, additionalFeatures: Record<string, string | boolean | Record<string, string | boolean>>, canAddLabelsToContainer: boolean) {
+export async function extendImage(params: DockerResolverParameters, config: SubstitutedConfig<DevContainerConfig>, imageName: string, additionalImageNames: string[], additionalFeatures: Record<string, string | boolean | Record<string, string | boolean>>, canAddLabelsToContainer: boolean) {
 	const { common } = params;
 	const { cliHost, output } = common;
 
@@ -38,6 +36,13 @@ export async function extendImage(params: DockerResolverParameters, config: Subs
 	const extendImageDetails = await getExtendImageBuildInfo(params, config, imageName, imageBuildInfo, undefined, additionalFeatures, canAddLabelsToContainer);
 	if (!extendImageDetails?.featureBuildInfo) {
 		// no feature extensions - return
+		if (additionalImageNames.length) {
+			if (params.isTTY) {
+				await Promise.all(additionalImageNames.map(name => dockerPtyCLI(params, 'tag', imageName, name)));
+			} else {
+				await Promise.all(additionalImageNames.map(name => dockerCLI(params, 'tag', imageName, name)));
+			}
+		}
 		return {
 			updatedImageName: [imageName],
 			imageMetadata: getDevcontainerMetadata(imageBuildInfo.metadata, config, extendImageDetails?.featuresConfig),
@@ -77,6 +82,12 @@ export async function extendImage(params: DockerResolverParameters, config: Subs
 				args.push('--load'); // (short for --output=docker, i.e. load into normal 'docker images' collection)
 			}
 		}
+		if (params.buildxCacheTo) {
+			args.push('--cache-to', params.buildxCacheTo);
+		}
+		if (!params.buildNoCache) {
+			params.additionalCacheFroms.forEach(cacheFrom => args.push('--cache-from', cacheFrom));
+		}
 
 		for (const buildContext in featureBuildInfo.buildKitContexts) {
 			args.push('--build-context', `${buildContext}=${featureBuildInfo.buildKitContexts[buildContext]}`);
@@ -86,6 +97,9 @@ export async function extendImage(params: DockerResolverParameters, config: Subs
 		args.push(
 			'build',
 		);
+	}
+	if (params.buildNoCache) {
+		args.push('--no-cache');
 	}
 	for (const buildArg in featureBuildInfo.buildArgs) {
 		args.push('--build-arg', `${buildArg}=${featureBuildInfo.buildArgs[buildArg]}`);
@@ -97,8 +111,9 @@ export async function extendImage(params: DockerResolverParameters, config: Subs
 	cliHost.mkdirp(emptyTempDir);
 	args.push(
 		'--target', featureBuildInfo.overrideTarget,
-		'-t', updatedImageName,
 		'-f', dockerfilePath,
+		...additionalImageNames.length > 0 ? additionalImageNames.map(name => ['-t', name]).flat() : ['-t', updatedImageName],
+		...params.additionalLabels.length > 0 ? params.additionalLabels.map(label => ['--label', label]).flat() : [],
 		emptyTempDir
 	);
 
@@ -110,7 +125,7 @@ export async function extendImage(params: DockerResolverParameters, config: Subs
 		await dockerCLI(infoParams, ...args);
 	}
 	return {
-		updatedImageName: [ updatedImageName ],
+		updatedImageName: additionalImageNames.length > 0 ? additionalImageNames : [updatedImageName],
 		imageMetadata: getDevcontainerMetadata(imageBuildInfo.metadata, config, featuresConfig),
 		imageDetails: async () => imageBuildInfo.imageDetails,
 	};
@@ -121,15 +136,12 @@ export async function getExtendImageBuildInfo(params: DockerResolverParameters, 
 	// Creates the folder where the working files will be setup.
 	const dstFolder = await createFeaturesTempFolder(params.common);
 
-	// Extracts the local cache of features.
-	await createLocalFeatures(params, dstFolder);
-
 	// Processes the user's configuration.
 	const platform = params.common.cliHost.platform;
 
 	const cacheFolder = await getCacheFolder(params.common.cliHost);
 	const { experimentalLockfile, experimentalFrozenLockfile } = params;
-	const featuresConfig = await generateFeaturesConfig({ ...params.common, platform, cacheFolder, experimentalLockfile, experimentalFrozenLockfile }, dstFolder, config.config, getContainerFeaturesFolder, additionalFeatures);
+	const featuresConfig = await generateFeaturesConfig({ ...params.common, platform, cacheFolder, experimentalLockfile, experimentalFrozenLockfile }, dstFolder, config.config, additionalFeatures);
 	if (!featuresConfig) {
 		if (canAddLabelsToContainer && !imageBuildInfo.dockerfile) {
 			return {
@@ -165,50 +177,6 @@ export function generateContainerEnvsV1(featuresConfig: FeaturesConfig) {
 		}
 	}
 	return result;
-}
-
-async function createLocalFeatures(params: DockerResolverParameters, dstFolder: string)
-{
-	const { common } = params;
-	const { cliHost, output } = common;
-
-	// Name of the local cache folder inside the working directory
-	const localCacheBuildFolderName = 'local-cache';
-
-	const srcFolder = getContainerFeaturesFolder(common.extensionPath);
-	output.write(`local container features stored at: ${srcFolder}`);
-	await cliHost.mkdirp(`${dstFolder}/${localCacheBuildFolderName}`);
-	const create = tar.c({
-		cwd: srcFolder,
-		filter: path => (path !== './Dockerfile' && path !== `./${V1_DEVCONTAINER_FEATURES_FILE_NAME}`),
-	}, ['.']);
-	const createExit = new Promise((resolve, reject) => {
-		create.on('error', reject);
-		create.on('finish', resolve);
-	});
-	const extract = await cliHost.exec({
-		cmd: 'tar',
-		args: [
-			'--no-same-owner',
-			'-x',
-			'-f', '-',
-		],
-		cwd: `${dstFolder}/${localCacheBuildFolderName}`,
-		output,
-	});
-	const stdoutDecoder = new StringDecoder();
-	extract.stdout.on('data', (chunk: Buffer) => {
-		output.write(stdoutDecoder.write(chunk));
-	});
-	const stderrDecoder = new StringDecoder();
-	extract.stderr.on('data', (chunk: Buffer) => {
-		output.write(toErrorText(stderrDecoder.write(chunk)));
-	});
-	create.pipe(extract.stdin);
-	await Promise.all([
-		extract.exit,
-		createExit, // Allow errors to surface.
-	]);
 }
 
 export interface ImageBuildOptions {
@@ -262,10 +230,11 @@ async function getFeaturesBuildOptions(params: DockerResolverParameters, devCont
 	// For non-Buildkit, we build a temporary image to hold the container-features content in a way
 	// that is accessible from the docker build for non-BuiltKit builds
 	// TODO generate an image name that is specific to this dev container?
-	const buildKitVersionParsed = params.buildKitVersion ? parseVersion(params.buildKitVersion) : null;
+	const buildKitVersionParsed = params.buildKitVersion?.versionMatch ? parseVersion(params.buildKitVersion.versionMatch) : undefined;
 	const minRequiredVersion = [0, 8, 0];
 	const useBuildKitBuildContexts = buildKitVersionParsed ? !isEarlierVersion(buildKitVersionParsed, minRequiredVersion) : false;
 	const buildContentImageName = 'dev_container_feature_content_temp';
+	const isBuildah = !!params.buildKitVersion?.versionString.toLowerCase().includes('buildah');
 
 	const omitPropertyOverride = params.common.skipPersistingCustomizationsFromFeatures ? ['customizations'] : [];
 	const imageMetadata = getDevcontainerMetadata(imageBuildInfo.metadata, devContainerConfig, featuresConfig, omitPropertyOverride, getOmitDevcontainerPropertyOverride(params.common));
@@ -282,14 +251,15 @@ async function getFeaturesBuildOptions(params: DockerResolverParameters, devCont
 	const contentSourceRootPath = useBuildKitBuildContexts ? '.' : '/tmp/build-features/';
 	const dockerfile = getContainerFeaturesBaseDockerFile(contentSourceRootPath)
 		.replace('#{nonBuildKitFeatureContentFallback}', useBuildKitBuildContexts ? '' : `FROM ${buildContentImageName} as dev_containers_feature_content_source`)
-		.replace('#{featureLayer}', getFeatureLayers(featuresConfig, containerUser, remoteUser, useBuildKitBuildContexts, contentSourceRootPath))
+		.replace('#{featureLayer}', getFeatureLayers(featuresConfig, containerUser, remoteUser, isBuildah, useBuildKitBuildContexts, contentSourceRootPath))
 		.replace('#{containerEnv}', generateContainerEnvsV1(featuresConfig))
 		.replace('#{devcontainerMetadata}', getDevcontainerMetadataLabel(imageMetadata))
 		.replace('#{containerEnvMetadata}', generateContainerEnvs(devContainerConfig.config.containerEnv, true))
 		;
 	const syntax = imageBuildInfo.dockerfile?.preamble.directives.syntax;
-	const dockerfilePrefixContent = `${useBuildKitBuildContexts && !(imageBuildInfo.dockerfile && supportsBuildContexts(imageBuildInfo.dockerfile)) ?
-		'# syntax=docker/dockerfile:1.4' :
+	const omitSyntaxDirective = common.omitSyntaxDirective; // Can be removed when https://github.com/moby/buildkit/issues/4556 is fixed
+	const dockerfilePrefixContent = `${omitSyntaxDirective ? '' :
+		useBuildKitBuildContexts && !(imageBuildInfo.dockerfile && supportsBuildContexts(imageBuildInfo.dockerfile)) ? '# syntax=docker/dockerfile:1.4' :
 		syntax ? `# syntax=${syntax}` : ''}
 ARG _DEV_CONTAINERS_BASE_IMAGE=placeholder
 `;
@@ -388,7 +358,7 @@ function getFeatureEnvVariables(f: Feature) {
 	const values = getFeatureValueObject(f);
 	const idSafe = getSafeId(f.id);
 	const variables = [];
-	
+
 	if(f.internalVersion !== '2')
 	{
 		if (values) {
@@ -409,7 +379,7 @@ function getFeatureEnvVariables(f: Feature) {
 			variables.push(`${f.buildArg}=${getFeatureMainValue(f)}`);
 		}
 		return variables;
-	}	
+	}
 }
 
 export async function getRemoteUserUIDUpdateDetails(params: DockerResolverParameters, mergedConfig: MergedDevContainerConfig, imageName: string, imageDetails: () => Promise<ImageDetails>, runArgsUser: string | undefined) {
@@ -432,6 +402,7 @@ export async function getRemoteUserUIDUpdateDetails(params: DockerResolverParame
 		imageName: fixedImageName,
 		remoteUser,
 		imageUser,
+		platform: [details.Os, details.Architecture, details.Variant].filter(Boolean).join('/')
 	};
 }
 
@@ -443,7 +414,7 @@ export async function updateRemoteUserUID(params: DockerResolverParameters, merg
 	if (!updateDetails) {
 		return imageName;
 	}
-	const { imageName: fixedImageName, remoteUser, imageUser } = updateDetails;
+	const { imageName: fixedImageName, remoteUser, imageUser, platform } = updateDetails;
 
 	const dockerfileName = 'updateUID.Dockerfile';
 	const srcDockerfile = path.join(common.extensionPath, 'scripts', dockerfileName);
@@ -459,7 +430,8 @@ export async function updateRemoteUserUID(params: DockerResolverParameters, merg
 		'build',
 		'-f', destDockerfile,
 		'-t', fixedImageName,
-		'--build-arg', `BASE_IMAGE=${imageName}`,
+		...(platform ? ['--platform', platform] : []),
+		'--build-arg', `BASE_IMAGE=${params.isPodman && !hasRegistryHostname(imageName) ? 'localhost/' : ''}${imageName}`, // Podman: https://github.com/microsoft/vscode-remote-release/issues/9748
 		'--build-arg', `REMOTE_USER=${remoteUser}`,
 		'--build-arg', `NEW_UID=${await cliHost.getuid!()}`,
 		'--build-arg', `NEW_GID=${await cliHost.getgid!()}`,
@@ -472,4 +444,13 @@ export async function updateRemoteUserUID(params: DockerResolverParameters, merg
 		await dockerCLI(params, ...args);
 	}
 	return fixedImageName;
+}
+
+function hasRegistryHostname(imageName: string) {
+	if (imageName.startsWith('localhost/')) {
+		return true;
+	}
+	const dot = imageName.indexOf('.');
+	const slash = imageName.indexOf('/');
+	return dot !== -1 && slash !== -1 && dot < slash;
 }
